@@ -1,0 +1,42 @@
+# Allowlist style: ignore everything at the root, then re-include tracked files.
+/*
+
+# Project files at the root
+!.gitignore
+!.gitattributes
+!.dockerignore
+!.env.example
+!README.md
+!requirements.txt
+!Dockerfile
+!docker-compose*.yml
+
+# Source and web packages
+!src/
+!web/
+
+# README screenshots
+!img/
+
+# Data directory: keep the (empty) folder, ignore all inputs/outputs that land here
+!data/
+data/*
+!data/.gitkeep
+
+# Python caches anywhere
+__pycache__/
+*.pyc
+*.pyo
+
+# Environments / secrets
+.env
+.venv/
+venv/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+CLAUDE.md

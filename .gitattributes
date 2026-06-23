@@ -1,0 +1,11 @@
+# Normalize line endings. This project runs in Docker (Linux), so every text
+# file is stored AND checked out as LF — even on Windows. Kills the
+# "LF will be replaced by CRLF" warnings and avoids CRLF sneaking into files
+# that Linux cares about (shell scripts, entrypoints, Dockerfile).
+* text=auto eol=lf
+
+# Binary assets: never touch these.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary

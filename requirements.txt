@@ -1,0 +1,16 @@
+whisperx==3.3.4
+# whisperx 3.3.4 leaves pyannote unpinned; pip pulls 4.x, whose API differs from
+# what whisperx expects (use_auth_token -> token). src/pipeline.py drives the 4.x
+# API directly, so pin 4.x explicitly to keep that contract stable.
+pyannote.audio==4.0.4
+omegaconf
+yt-dlp
+python-dotenv
+pandas
+torch
+torchvision
+torchaudio
+fastapi
+uvicorn[standard]
+python-multipart
+nvidia-ml-py

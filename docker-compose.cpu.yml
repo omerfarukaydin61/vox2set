@@ -1,0 +1,24 @@
+# CPU-only variant. Same image as the GPU compose (the cu128 PyTorch wheel runs
+# fine on CPU — it just won't use a GPU), but with no GPU reservation and the
+# device/compute defaults forced to CPU. Transcription is considerably slower.
+#
+#   docker compose -f docker-compose.cpu.yml up -d --build   # web UI at :8800
+#
+services:
+  app:
+    build: .
+    ports:
+      - "8800:8000"   # web UI at http://localhost:8800 (host:container)
+    env_file:
+      - .env
+    # `environment` overrides `.env`, so the web UI defaults to cpu / int8.
+    environment:
+      - DEVICE=cpu
+      - COMPUTE_TYPE=int8
+    volumes:
+      - ./data:/data           # inputs + generated .srt + job state (voxset.db) land here
+      - model-cache:/cache     # persist downloaded models between runs
+    # No `deploy.reservations.devices` block here → no GPU is requested.
+
+volumes:
+  model-cache:

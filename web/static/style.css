@@ -110,6 +110,20 @@ html[data-theme="dark"] #theme-btn .ico-sun { display:block; }
 .rowcard-meta { font-size:11.5px; color:var(--faint); font-family:"JetBrains Mono",monospace;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:flex; align-items:center; gap:7px; }
 .rowcard-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:4px; }
+/* language chips on a dataset card (original + translations) */
+.srt-langs { display:flex; flex-wrap:wrap; gap:6px; margin-top:7px; }
+.srt-lang { display:inline-flex; align-items:center; gap:5px; padding:3px 5px 3px 9px;
+  border-radius:99px; font-size:10.5px; font-weight:700; letter-spacing:.04em; cursor:pointer;
+  color:var(--accent); background:var(--accent-soft); border:1px solid transparent;
+  transition:border-color .12s, background .12s; }
+.srt-lang:hover { border-color:var(--accent); }
+.srt-lang-x { display:inline-flex; align-items:center; justify-content:center; width:15px; height:15px;
+  padding:0; border:none; border-radius:50%; background:transparent; color:var(--faint);
+  font-size:10px; cursor:pointer; transition:background .12s, color .12s; }
+.srt-lang-x:hover { background:var(--err-soft); color:var(--err); }
+.ds-del { align-self:center; }
+.srt-translating { margin-top:6px; font-size:11.5px; font-weight:600; color:var(--accent);
+  font-variant-numeric:tabular-nums; }
 
 /* disabled "filling" placeholder card while a job runs */
 .rowcard.pending { position:relative; overflow:hidden; cursor:default; align-items:center; }
@@ -121,6 +135,7 @@ html[data-theme="dark"] #theme-btn .ico-sun { display:block; }
   border:1px solid var(--line); background:var(--panel); color:var(--muted); border-radius:8px; cursor:pointer;
   transition:background .12s, color .12s, border-color .12s; }
 .ds-stop:hover { background:var(--err-soft); color:var(--err); border-color:transparent; }
+.ds-stop.retry:hover { background:var(--accent-soft); color:var(--accent); }
 .ds-stop:disabled { opacity:.5; cursor:progress; }
 .job-stop { display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border-radius:7px;
   border:1px solid var(--line); background:var(--panel); color:var(--err); font:inherit; font-size:10.5px;
@@ -258,13 +273,26 @@ html[data-theme="dark"] #theme-btn .ico-sun { display:block; }
 .gpu-tip .tip-row b { font-weight:600; margin-left:auto; }
 
 /* downloads */
-.dl-list { display:flex; flex-direction:column; gap:13px; }
-.dl-row { display:flex; flex-direction:column; gap:7px; }
-.dl-info { display:flex; align-items:center; justify-content:space-between; gap:10px; }
-.dl-title { font-size:12.5px; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* download progress rendered inline in the fetch preview list */
+.pl-row.dl-row { cursor:default; }
+.pl-row.dl-row:hover { background:none; }
+.dl-rmain { flex:1; min-width:0; display:flex; flex-direction:column; gap:5px; }
+.dl-info { display:flex; align-items:center; gap:8px; }
+.dl-info .pl-title { font-weight:500; }
 .dl-state { font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
 .dl-state.done { color:var(--ok); } .dl-state.err { color:var(--err); }
+.dl-cancel { display:inline-flex; align-items:center; justify-content:center; flex:none;
+  width:20px; height:20px; padding:0; border:none; border-radius:6px; background:transparent;
+  color:var(--muted); cursor:pointer; transition:background .12s, color .12s; }
+.dl-cancel:hover { background:var(--err-soft); color:var(--err); }
+.dl-cancel:disabled { opacity:.4; cursor:default; }
+.dl-retry { display:inline-flex; align-items:center; justify-content:center; flex:none;
+  width:22px; height:22px; padding:0; border:none; border-radius:6px; background:transparent;
+  color:var(--muted); cursor:pointer; transition:background .12s, color .12s; }
+.dl-retry:hover { background:var(--accent-soft); color:var(--accent); }
+.dl-retry:disabled { opacity:.4; cursor:progress; }
 .dl-err { font-size:11px; color:var(--err); }
+.pv-head-stop { display:flex; align-items:center; justify-content:space-between; gap:10px; }
 
 .bar { flex:1; height:9px; background:var(--line); border-radius:99px; overflow:hidden; }
 .bar.small { height:7px; }
@@ -383,6 +411,17 @@ html[data-theme="dark"] select {
 .ds-title h3 { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:520px; }
 .ds-head-actions { display:flex; align-items:center; gap:8px; flex:none; }
 .ds-warn { background:var(--warn-soft); color:var(--warn); border-radius:10px; padding:10px 14px; font-size:12.5px; margin-bottom:14px; }
+.ds-translate { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:14px;
+  padding:10px 14px; background:var(--panel-2); border:1px solid var(--line); border-radius:12px; }
+.dst-ico { display:inline-flex; color:var(--accent); flex:none; }
+.dst-label { font-size:12.5px; font-weight:600; }
+/* inherit the global select look (theme bg + custom arrow); only resize it so
+   it fits the inline bar instead of stretching full-width */
+.dst-sel { width:auto; min-width:160px; font-size:12.5px; padding-top:7px; padding-bottom:7px; }
+.dst-status { font-size:12px; color:var(--muted); }
+.dst-status.ok { color:var(--ok); }
+.dst-status.err { color:var(--err); }
+.dst-status a { color:var(--accent); font-weight:600; }
 .ds-table-wrap { overflow-y:auto; border:1px solid var(--line); border-radius:12px; max-height:calc(90vh - 110px); }
 .ds-table { width:100%; border-collapse:collapse; font-size:13px; }
 .ds-table thead th { position:sticky; top:0; z-index:1; text-align:left; padding:11px 14px; font-size:10.5px;
@@ -392,9 +431,16 @@ html[data-theme="dark"] select {
 .ds-table tbody tr:last-child td { border-bottom:none; }
 .ds-table tbody tr:hover { background:var(--panel-2); }
 .c-idx { width:48px; }
+.c-spk { width:78px; }
 .c-audio { width:300px; }
 .c-time { width:150px; white-space:nowrap; }
 .ds-idx { font-family:"JetBrains Mono",monospace; color:var(--faint); font-variant-numeric:tabular-nums; }
+.ds-spk { white-space:nowrap; }
+.spk-badge { display:inline-flex; padding:2px 8px; border-radius:99px; font-size:10.5px; font-weight:700;
+  letter-spacing:.03em; white-space:nowrap; color:var(--spk);
+  background:color-mix(in srgb, var(--spk) 15%, transparent);
+  border:1px solid color-mix(in srgb, var(--spk) 32%, transparent); }
+.ds-nospk { color:var(--faint); }
 .ds-text { line-height:1.5; }
 .ds-time { font-family:"JetBrains Mono",monospace; font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; }
 .ds-time small { color:var(--faint); display:block; margin-top:2px; }

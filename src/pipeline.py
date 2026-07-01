@@ -2,7 +2,7 @@ import os
 import warnings
 from importlib.metadata import version
 
-from .util import log as default_log, write_srt, srt_path_for
+from .util import log as default_log, write_srt, write_speakers, srt_path_for
 
 
 def _free_cuda():
@@ -151,6 +151,29 @@ def _diarize(audio, hf_token, device, model_name="pyannote/speaker-diarization-3
     return df
 
 
+def _tighten_segments(segments, pad=0.15):
+    """Trim each cue to its actual word timestamps so it disappears when the
+    speech ends instead of lingering through the silence until the next cue.
+
+    Whisper's segment `end` is often stretched to (or near) the next segment's
+    start; alignment gives per-word times, so we reset start/end from the first
+    and last *timed* words (+ a small trailing pad), then clamp so a cue never
+    overlaps the next. No-op for segments without word timings (alignment
+    unavailable), which simply keep Whisper's coarse boundaries.
+    """
+    for seg in segments:
+        words = [w for w in seg.get("words", [])
+                 if w.get("start") is not None and w.get("end") is not None]
+        if not words:
+            continue
+        seg["start"] = max(0.0, words[0]["start"])
+        seg["end"] = words[-1]["end"] + pad
+    for cur, nxt in zip(segments, segments[1:]):
+        if cur["end"] > nxt["start"]:          # don't bleed into the next cue
+            cur["end"] = nxt["start"]
+    return segments
+
+
 def run_pipeline(*, audio_file=None, language="en",
                  model="large-v3", device="cuda", compute_type="float16",
                  batch_size=16, hf_token=None, data_dir="data", out_dir=None,
@@ -251,6 +274,10 @@ def run_pipeline(*, audio_file=None, language="en",
 
     _free_cuda()
     log(f"Writing dataset to: {srt_path}", "write")
+    # tighten cue end times to the actual speech (when aligned) so subtitles
+    # don't hang on screen through the silence before the next line
+    _tighten_segments(result["segments"])
     write_srt(result["segments"], srt_path)
+    write_speakers(srt_path, result["segments"])   # speaker labels sidecar (if any)
     log(f"Dataset ready: {srt_path}", "done")
     return srt_path

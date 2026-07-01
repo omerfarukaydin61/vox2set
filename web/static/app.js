@@ -25,12 +25,24 @@ function fmtClock(sec) {
 }
 function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
 
+// speaker id -> small colored badge ("SPEAKER_03" -> "S03"); blank => em dash
+const SPK_COLORS = ["#6d5ef0", "#16a34a", "#e0742f", "#d6457d", "#2596be", "#8b5cf6", "#ca8a04", "#0ea5e9"];
+function spkBadge(label) {
+  if (!label) return `<span class="ds-nospk">—</span>`;
+  const m = /(\d+)/.exec(label);
+  const idx = m ? parseInt(m[1], 10) : [...label].reduce((a, c) => a + c.charCodeAt(0), 0);
+  const color = SPK_COLORS[idx % SPK_COLORS.length];
+  const short = m ? `S${m[1]}` : label;
+  return `<span class="spk-badge" style="--spk:${color}" title="${esc(label)}">${esc(short)}</span>`;
+}
+
 const ICO = {
   audio: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`,
   video: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>`,
   srt: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 15h5M7 11h10"/></svg>`,
   playlist: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h13M3 12h13M3 18h9M17 12v7l5-3.5z"/></svg>`,
   stop: `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="2.5"/></svg>`,
+  retry: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v5h-5"/></svg>`,
 };
 
 // compact row action icons
@@ -74,7 +86,8 @@ $$("[data-toggle]").forEach((head) =>
 const urlInput = $("url"), fetchBtn = $("fetch-btn"), preview = $("preview"),
       dlControls = $("dl-controls"), qualitySel = $("quality"),
       qualityField = $("quality-field"), downloadBtn = $("download-btn");
-let mode = "audio", currentInfo = null, dlTimer = null;
+let mode = "audio", currentInfo = null, dlSource = null, currentDlId = null,
+    dlCanceling = false, dlActive = false, dlThumbs = {};
 
 const QUALITY = {
   audio: [{ v: "best", t: "Best audio (mp3)" }],
@@ -99,7 +112,10 @@ $$(".seg-btn").forEach((b) => b.addEventListener("click", () => {
 }));
 fillQuality();
 
-// ---------- transcription languages (full Whisper set) ----------
+// ---------- transcription language (full Whisper set + Auto-detect) ----------
+// This is the SOURCE/spoken language of the audio (no translation happens).
+// Auto-detect is the default but can misfire (e.g. English intro music read as
+// Chinese), so the user can force the correct language here.
 const LANGS = [
   ["en","English"],["zh","Chinese"],["de","German"],["es","Spanish"],["ru","Russian"],
   ["ko","Korean"],["fr","French"],["ja","Japanese"],["pt","Portuguese"],["tr","Turkish"],
@@ -126,8 +142,8 @@ function fillLanguages() {
   const sel = $("language");
   const opt = (v, t, s) => { const o = document.createElement("option"); o.value = v; o.textContent = t; o.selected = !!s; return o; };
   sel.innerHTML = "";
-  sel.appendChild(opt("auto", "Auto-detect"));
-  sel.appendChild(opt("en", "English (en)", true));   // default
+  sel.appendChild(opt("auto", "Auto-detect", true));   // default
+  sel.appendChild(opt("en", "English (en)"));
   [...LANGS].filter(([c]) => c !== "en").sort((a, b) => a[1].localeCompare(b[1]))
     .forEach(([c, n]) => sel.appendChild(opt(c, `${n} (${c})`)));
 }
@@ -144,6 +160,7 @@ function resetAddBox() {
 }
 
 async function fetchInfo() {
+  if (dlActive) return;   // the preview is showing a live download
   const url = urlInput.value.trim();
   if (!url) { urlInput.focus(); return; }
   preview.classList.remove("hidden");
@@ -198,20 +215,25 @@ async function startDownload() {
   data.set("url", urlInput.value.trim());
   data.set("mode", mode);
   data.set("quality", qualitySel.value);
+  // snapshot thumbnails so the progress rows keep their preview images
+  dlThumbs = {};
   if (currentInfo.type === "playlist") {
     const ids = [...preview.querySelectorAll(".pl-check:checked")].map((c) => c.value);
     if (!ids.length) { alert("Select at least one video."); return; }
     data.set("entry_ids", ids.join(","));
+    currentInfo.entries.forEach((e) => { dlThumbs[e.id] = e.thumbnail; });
+  } else {
+    dlThumbs[currentInfo.id] = currentInfo.thumbnail;
   }
   downloadBtn.disabled = true;
   try {
     const res = await fetch("/api/downloads", { method: "POST", body: data });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Download failed to start");
     const { download_id } = await res.json();
-    resetAddBox();
-    if (dlTimer) clearInterval(dlTimer);
-    dlTimer = setInterval(() => pollDownload(download_id), 1000);
-    pollDownload(download_id);
+    // swap the fetch list in-place into a live download list (same component)
+    dlControls.classList.add("hidden");
+    fetchBtn.disabled = true; urlInput.disabled = true;
+    openDownloadStream(download_id);
   } catch (err) {
     alert(err.message);
   } finally {
@@ -219,44 +241,128 @@ async function startDownload() {
   }
 }
 
-async function pollDownload(id) {
-  try {
-    const res = await fetch("/api/downloads/" + id);
-    if (!res.ok) throw new Error("lost download");
-    const dl = await res.json();
-    renderDownloads(dl);
-    if (dl.status === "done") {
-      clearInterval(dlTimer); dlTimer = null;
+// live-tail one download over SSE (snapshot + every subsequent snapshot)
+function openDownloadStream(id) {
+  currentDlId = id; dlCanceling = false; dlActive = true;
+  if (dlSource) dlSource.close();
+  dlSource = new EventSource("/api/downloads/" + id + "/events");
+  dlSource.onmessage = (e) => {
+    const dl = JSON.parse(e.data);
+    renderDownloadProgress(dl);
+    if (dl.status === "done" || dl.status === "canceled") {
+      dlSource.close(); dlSource = null; dlCanceling = false;
       loadLibrary();
-      setActivityDot();
-      setTimeout(() => {
-        if (!dlTimer) { $("downloads").classList.add("hidden"); updateActivityEmpty(); }
-      }, 5000);
+      // keep the list open if anything failed (so the user can retry / close);
+      // otherwise tidy up automatically after a moment.
+      const hasErr = dl.items.some((i) => i.status === "error");
+      if (!hasErr) setTimeout(() => { if (!dlSource) endDownloadView(); }, 4000);
     }
-  } catch {
-    clearInterval(dlTimer); dlTimer = null; setActivityDot();
-  }
+  };
 }
 
-function renderDownloads(dl) {
-  $("downloads").classList.remove("hidden");
-  updateActivityEmpty(); setActivityDot();
+// restore the add box once the download finishes / is dismissed
+function endDownloadView() {
+  if (dlSource) { dlSource.close(); dlSource = null; }
+  dlActive = false; currentDlId = null;
+  fetchBtn.disabled = false; urlInput.disabled = false;
+  resetAddBox();
+}
+
+// render the download into the fetch preview list (no separate component)
+function renderDownloadProgress(dl) {
+  preview.classList.remove("hidden");
   const done = dl.items.filter((i) => i.status === "done").length;
   const err = dl.items.filter((i) => i.status === "error").length;
-  $("dl-summary").textContent = `${done}/${dl.items.length} done${err ? ` · ${err} failed` : ""}`;
-  $("dl-list").innerHTML = dl.items.map((it) => {
+  const stopped = dl.items.filter((i) => i.status === "canceled").length;
+  const terminal = dl.status === "done" || dl.status === "canceled";
+  const summary = `${done}/${dl.items.length} done`
+    + (err ? ` · ${err} failed` : "") + (stopped ? ` · ${stopped} stopped` : "");
+  const headBtn = terminal
+    ? `<button id="dl-close" class="job-stop" title="Close">${ACT.del}<span>Close</span></button>`
+    : `<button id="dl-stop" class="job-stop" title="Stop all"${dlCanceling ? " disabled" : ""}>
+        ${ICO.stop}<span>${dlCanceling ? "Stopping…" : "Stop all"}</span></button>`;
+
+  const rows = dl.items.map((it, idx) => {
     const p = Math.round((it.progress || 0) * 100);
-    const cls = it.status === "error" ? "err" : it.status === "done" ? "done" : "";
+    const cls = it.status === "error" ? "err"
+      : it.status === "done" ? "done"
+      : it.status === "canceled" ? "err" : "";
     const right = it.status === "error" ? "failed"
       : it.status === "done" ? "✓"
+      : it.status === "canceled" ? "stopped"
       : it.status === "processing" ? "processing…" : `${p}%`;
-    return `<div class="dl-row">
-      <div class="dl-info"><span class="dl-title">${esc(it.title)}</span>
-        <span class="dl-state ${cls}">${right}</span></div>
-      <div class="bar small"><div class="bar-fill ${cls}" style="width:${it.status === "done" ? 100 : p}%"></div></div>
-      ${it.error ? `<div class="dl-err">${esc(it.error)}</div>` : ""}
+    // failed items get a retry button; still-active ones get a cancel button
+    const cancelBtn = it.status === "error"
+      ? `<button class="dl-retry" data-dl-retry="${idx}" title="Retry this download">${ICO.retry}</button>`
+      : (it.status === "done" || it.status === "canceled") ? ""
+      : `<button class="dl-cancel" data-dl-item="${idx}" title="Cancel this download">${ACT.del}</button>`;
+    const thumb = dlThumbs[it.id];
+    const thumbEl = thumb
+      ? `<img class="pl-thumb" src="${esc(thumb)}" alt="" loading="lazy" onerror="this.classList.add('broken')" />`
+      : `<span class="pl-thumb ph"></span>`;
+    return `<div class="pl-row dl-row">
+      ${thumbEl}
+      <div class="dl-rmain">
+        <div class="dl-info">
+          <span class="pl-title" title="${esc(it.title)}">${esc(it.title)}</span>
+          <span class="dl-state ${cls}">${right}</span>
+          ${cancelBtn}
+        </div>
+        <div class="bar small"><div class="bar-fill ${cls}" style="width:${it.status === "done" ? 100 : p}%"></div></div>
+        ${it.error ? `<div class="dl-err">${esc(it.error)}</div>` : ""}
+      </div>
     </div>`;
   }).join("");
+
+  // preserve the list scroll position across the 1s re-renders
+  const prevList = preview.querySelector(".pl-list");
+  const scroll = prevList ? prevList.scrollTop : 0;
+
+  preview.innerHTML = `
+    <div class="pv-body pv-head-stop">
+      <div><h3>⬇ Downloading</h3><p>${summary}</p></div>
+      ${headBtn}
+    </div>
+    <div class="pl-list">${rows}</div>`;
+
+  preview.querySelector(".pl-list").scrollTop = scroll;
+
+  preview.querySelectorAll("[data-dl-item]").forEach((b) =>
+    b.addEventListener("click", () => cancelDownloadItem(+b.dataset.dlItem, b)));
+  preview.querySelectorAll("[data-dl-retry]").forEach((b) =>
+    b.addEventListener("click", () => retryDownloadItem(+b.dataset.dlRetry, b)));
+  const sb = preview.querySelector("#dl-stop");
+  if (sb) sb.addEventListener("click", cancelDownload);
+  const cb = preview.querySelector("#dl-close");
+  if (cb) cb.addEventListener("click", endDownloadView);
+}
+
+async function cancelDownloadItem(idx, btn) {
+  if (!currentDlId) return;
+  if (btn) btn.disabled = true;
+  try { await fetch(`/api/downloads/${encodeURIComponent(currentDlId)}/cancel/${idx}`, { method: "POST" }); }
+  catch { /* the live stream will reconcile */ }
+}
+
+async function retryDownloadItem(idx, btn) {
+  if (!currentDlId) return;
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch(`/api/downloads/${encodeURIComponent(currentDlId)}/retry/${idx}`, { method: "POST" });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Retry failed");
+    // the item is downloading again — re-attach the live stream (the previous
+    // one closed when the download reached a terminal state).
+    openDownloadStream(currentDlId);
+  } catch (err) { alert(err.message); if (btn) btn.disabled = false; }
+}
+
+async function cancelDownload() {
+  if (!currentDlId || dlCanceling) return;
+  dlCanceling = true;
+  const sb = preview.querySelector("#dl-stop");
+  if (sb) { sb.disabled = true; sb.querySelector("span").textContent = "Stopping…"; }
+  try { await fetch(`/api/downloads/${encodeURIComponent(currentDlId)}/cancel`, { method: "POST" }); }
+  catch { /* the live stream will reconcile */ }
 }
 
 // ============================================================
@@ -425,7 +531,6 @@ async function loadSubtitles() {
   try {
     const { items } = await (await fetch("/api/subtitles")).json();
     renderSubtitles(items);
-    $("ds-count").textContent = items.length || "";
   } catch {
     $("srt-list").innerHTML = ""; $("srt-empty").classList.remove("hidden");
   }
@@ -433,29 +538,70 @@ async function loadSubtitles() {
 
 function renderSubtitles(items) {
   const empty = $("srt-empty");
-  if (!items.length) { $("srt-list").innerHTML = ""; empty.classList.toggle("hidden", pending.size > 0); return; }
+  if (!items.length) {
+    $("srt-list").innerHTML = ""; $("ds-count").textContent = "";
+    empty.classList.toggle("hidden", pending.size > 0); return;
+  }
   empty.classList.add("hidden");
-  $("srt-list").innerHTML = items.map((it) => `
-    <div class="rowcard clickable" data-open="${esc(it.name)}">
+
+  // group a source's subtitle variants (original + translations) into one card,
+  // keyed by base — so translating doesn't spawn a duplicate-looking entry.
+  const groups = [];
+  const byBase = new Map();
+  for (const it of items) {                       // items are newest-first
+    const key = it.base || it.name;
+    let g = byBase.get(key);
+    if (!g) { g = { base: key, title: it.title, items: [] }; byBase.set(key, g); groups.push(g); }
+    g.items.push(it);
+  }
+  $("ds-count").textContent = groups.length || "";
+
+  $("srt-list").innerHTML = groups.map((g, gi) => {
+    const total = g.items.reduce((a, i) => a + (i.size || 0), 0);
+    const n = g.items.length;
+    const chips = g.items.map((it) => `
+      <span class="srt-lang" data-open="${esc(it.name)}" title="Open ${esc((it.lang || "").toUpperCase())} dataset">
+        ${esc((it.lang || "?").toUpperCase())}
+        <button class="srt-lang-x" data-del="${esc(it.name)}" title="Delete this language">✕</button>
+      </span>`).join("");
+    return `<div class="rowcard clickable" data-open="${esc(g.items[0].name)}">
       <span class="cell-ico srt">${ICO.srt}</span>
       <div class="rowcard-main">
-        <div class="rowcard-name" title="${esc(it.title)}">${esc(it.title)}
-          ${it.lang ? `<span class="lang-badge">${esc(it.lang)}</span>` : ""}</div>
-        <div class="rowcard-meta">Speech dataset · ${fmtSize(it.size)}</div>
-        <div class="rowcard-actions">
-          <button class="btn-xs primary" data-open="${esc(it.name)}">Open dataset</button>
-          <button class="btn-xs danger" data-del="${esc(it.name)}">Delete</button>
-        </div>
+        <div class="rowcard-name" title="${esc(g.title)}">${esc(g.title)}</div>
+        <div class="rowcard-meta">Speech dataset · ${n} language${n > 1 ? "s" : ""} · ${fmtSize(total)}</div>
+        <div class="srt-langs">${chips}</div>
+        <div class="srt-translating hidden" data-tbase="${esc(g.base)}"></div>
       </div>
-    </div>`).join("");
+      <button class="iconbtn danger ds-del" data-delgroup="${gi}" title="Delete ${n > 1 ? `all ${n} language versions` : "dataset"}">${ACT.del}</button>
+    </div>`;
+  }).join("");
+
+  // the card's trash button deletes the whole group; a chip's ✕ deletes one
+  // language; the chip (or the card body) opens a dataset.
+  $("srt-list").querySelectorAll("[data-delgroup]").forEach((b) =>
+    b.addEventListener("click", (e) => { e.stopPropagation(); deleteDatasetGroup(groups[+b.dataset.delgroup]); }));
   $("srt-list").querySelectorAll("[data-del]").forEach((b) =>
     b.addEventListener("click", (e) => { e.stopPropagation(); deleteSubtitle(b.dataset.del); }));
   $("srt-list").querySelectorAll("[data-open]").forEach((el) =>
     el.addEventListener("click", (e) => { e.stopPropagation(); openDataset(el.dataset.open); }));
+  paintTranslating();       // reflect any in-progress translation on its card
+}
+
+async function deleteDatasetGroup(g) {
+  if (!g) return;
+  const msg = g.items.length > 1
+    ? `Delete all ${g.items.length} language versions of "${g.title}"?`
+    : `Delete dataset "${g.title}"?`;
+  if (!confirm(msg)) return;
+  for (const it of g.items) {
+    try { await fetch("/api/subtitles/" + encodeURIComponent(it.name), { method: "DELETE" }); }
+    catch { /* keep going */ }
+  }
+  loadSubtitles(); loadLibrary();
 }
 
 async function deleteSubtitle(name) {
-  if (!confirm(`Delete dataset "${name}"?`)) return;
+  if (!confirm(`Delete this subtitle (${name})?`)) return;
   try {
     await fetch("/api/subtitles/" + encodeURIComponent(name), { method: "DELETE" });
     loadSubtitles(); loadLibrary();
@@ -496,23 +642,132 @@ async function openDataset(name) {
         : `<span class="ds-noaudio">no source audio</span>`;
       return `<tr>
         <td class="ds-idx">${s.index}</td>
+        <td class="ds-spk">${spkBadge(s.speaker)}</td>
         <td>${audio}</td>
         <td class="ds-text">${esc(s.text)}</td>
         <td class="ds-time">${fmtClock(s.start)} → ${fmtClock(s.end)}<small>${(s.end - s.start).toFixed(2)}s</small></td>
       </tr>`;
     }).join("");
+    dsCurrentName = name;
+    setupTranslate(d.lang, d.base);
   } catch (err) {
     $("ds-title").textContent = "Could not load dataset";
-    $("ds-rows").innerHTML = `<tr><td colspan="4" style="padding:20px;color:var(--err)">${esc(err.message)}</td></tr>`;
+    $("ds-rows").innerHTML = `<tr><td colspan="5" style="padding:20px;color:var(--err)">${esc(err.message)}</td></tr>`;
   }
 }
+
+// ---------- dataset → translate component (in the modal) ----------
+// Languages NLLB can target (mirror of src/translate.py FLORES keys).
+const TARGET_LANGS = [
+  ["ar","Arabic"],["az","Azerbaijani"],["zh","Chinese"],["cs","Czech"],["da","Danish"],
+  ["nl","Dutch"],["en","English"],["fi","Finnish"],["fr","French"],["de","German"],
+  ["el","Greek"],["he","Hebrew"],["hi","Hindi"],["hu","Hungarian"],["id","Indonesian"],
+  ["it","Italian"],["ja","Japanese"],["ko","Korean"],["fa","Persian"],["pl","Polish"],
+  ["pt","Portuguese"],["ro","Romanian"],["ru","Russian"],["es","Spanish"],["sv","Swedish"],
+  ["th","Thai"],["tr","Turkish"],["uk","Ukrainian"],["vi","Vietnamese"],
+];
+const TARGET_SET = new Set(TARGET_LANGS.map(([c]) => c));
+let dsCurrentName = null, dsCurrentBase = null;
+const translateJobs = new Map();   // jobId -> {base, target, progress, status, srt, error, source}
+
+function activeTranslateFor(base) {
+  for (const r of translateJobs.values())
+    if (r.base === base && !["done", "error", "canceled"].includes(r.status)) return r;
+  return null;
+}
+function setDstStatus(text, cls, html) {
+  const s = $("dst-status"); if (!s) return;
+  s.className = "dst-status" + (cls ? ` ${cls}` : "");
+  if (html) s.innerHTML = html; else s.textContent = text;
+}
+
+function setupTranslate(srcLang, base) {
+  dsCurrentBase = base;
+  const src = (srcLang || "").toLowerCase();
+  const sel = $("dst-lang");
+  sel.innerHTML = "";
+  TARGET_LANGS.filter(([c]) => c !== src).forEach(([c, n]) => {
+    const o = document.createElement("option");
+    o.value = c; o.textContent = `${n} (${c})`;
+    o.selected = c === "tr" || (c === "en" && src !== "en");
+    sel.appendChild(o);
+  });
+  const supported = TARGET_SET.has(src);
+  const active = activeTranslateFor(base);
+  if (active) {
+    $("dst-go").disabled = true;
+    setDstStatus(`Translating to ${(active.target || "").toUpperCase()}… ${Math.round((active.progress || 0) * 100)}%`);
+  } else {
+    $("dst-go").disabled = !supported;
+    setDstStatus(supported ? "" : `Source language "${srcLang || "?"}" not supported for translation.`, supported ? "" : "err");
+  }
+}
+
+$("dst-go").addEventListener("click", translateDataset);
+async function translateDataset() {
+  if (!dsCurrentName) return;
+  const to = $("dst-lang").value;
+  $("dst-go").disabled = true; setDstStatus("Starting…");
+  try {
+    const data = new FormData(); data.set("to", to);
+    const res = await fetch(`/api/dataset/${encodeURIComponent(dsCurrentName)}/translate`, { method: "POST", body: data });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Translation failed to start");
+    const { job_id } = await res.json();
+    startTranslateJob(job_id);
+  } catch (err) { setDstStatus(err.message, "err"); $("dst-go").disabled = false; }
+}
+
+// Live-tail a translation independently of the modal: progress is tracked
+// globally and painted onto the source dataset card, so closing the popup
+// doesn't hide it — the job keeps running and stays visible.
+function startTranslateJob(jobId) {
+  const es = new EventSource(`/api/translate/${jobId}/events`);
+  translateJobs.set(jobId, { progress: 0, status: "queued", source: es });
+  es.onmessage = (e) => {
+    const j = JSON.parse(e.data);
+    const rec = translateJobs.get(jobId) || {};
+    rec.base = (j.params && j.params.base) || rec.base;
+    rec.target = j.target || rec.target;
+    rec.progress = j.progress || 0; rec.status = j.status; rec.srt = j.srt; rec.error = j.error;
+    translateJobs.set(jobId, rec);
+    paintTranslating();
+    if (["done", "error", "canceled"].includes(j.status)) {
+      es.close(); translateJobs.delete(jobId);
+      // mirror the final state in the modal if it's still open on this dataset
+      if (dsCurrentBase && rec.base === dsCurrentBase && !$("ds-modal").classList.contains("hidden")) {
+        $("dst-go").disabled = false;
+        if (j.status === "done") setDstStatus("", "ok", `Done: <a href="/api/srt/${encodeURIComponent(rec.srt)}" download>${esc(rec.srt)}</a>`);
+        else setDstStatus(j.status === "canceled" ? "Canceled" : `Failed — ${rec.error || "translation error"}`, "err");
+      }
+      loadSubtitles();     // the translated .srt shows up as a new language chip
+    }
+  };
+}
+
+// paint in-progress translations onto the modal (if open) + the dataset cards
+function paintTranslating() {
+  if (dsCurrentBase && !$("ds-modal").classList.contains("hidden")) {
+    const a = activeTranslateFor(dsCurrentBase);
+    if (a) { $("dst-go").disabled = true; setDstStatus(`Translating to ${(a.target || "").toUpperCase()}… ${Math.round((a.progress || 0) * 100)}%`); }
+  }
+  document.querySelectorAll(".srt-translating[data-tbase]").forEach((el) => {
+    const a = activeTranslateFor(el.dataset.tbase);
+    if (a) { el.classList.remove("hidden"); el.textContent = `Translating to ${(a.target || "").toUpperCase()}… ${Math.round((a.progress || 0) * 100)}%`; }
+    else { el.classList.add("hidden"); el.textContent = ""; }
+  });
+}
+
+// closing the modal just clears its dataset refs; background streams stay alive
+function onDatasetModalClosed() { dsCurrentName = null; dsCurrentBase = null; }
+$("ds-modal").addEventListener("click", (e) => { if (e.target === $("ds-modal")) onDatasetModalClosed(); });
+document.querySelector('[data-close="ds-modal"]').addEventListener("click", onDatasetModalClosed);
 
 // ============================================================
 //  Transcription — single file or a whole playlist
 // ============================================================
 let modalTargets = [];                 // [{name, title}] queued by the modal
-let jobTimer = null;
 const pending = new Map();              // jobId -> {name, title, progress, stage, status, logs}
+const jobSources = new Map();           // jobId -> EventSource (live tail)
 const STAGE_LABELS = {
   queued: "Waiting…", starting: "Spinning up…", load: "Loading model…",
   info: "Reading source…", transcribe: "Transcribing speech…",
@@ -536,7 +791,7 @@ $("tx-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   if (!modalTargets.length) return;
   const base = {
-    language: $("language").value.trim() || "en",
+    language: $("language").value || "auto",
     model: $("model").value,
     device: $("device").value,
     compute_type: $("compute_type").value,
@@ -546,6 +801,7 @@ $("tx-form").addEventListener("submit", async (e) => {
   modalTargets = [];
   $("tx-modal").classList.add("hidden");
 
+  const newIds = [];
   for (const t of targets) {
     try {
       const data = new FormData();
@@ -555,44 +811,51 @@ $("tx-form").addEventListener("submit", async (e) => {
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Could not start job");
       const { job_id } = await res.json();
       pending.set(job_id, { name: t.name, title: t.title || t.name, progress: 0, stage: "queued", status: "queued", logs: [] });
+      newIds.push(job_id);
     } catch (err) {
       alert(err.message);
     }
   }
 
-  renderPending();
   $("job").classList.remove("hidden");
-  updateActivityEmpty(); setActivityDot();
-  if (!jobTimer) jobTimer = setInterval(pollAll, 1000);
-  pollAll();
+  newIds.forEach(openJobStream);
+  refreshJobsUI();
 });
 
-async function pollAll() {
-  for (const [id, p] of [...pending]) {
-    try {
-      const res = await fetch("/api/jobs/" + id);
-      if (!res.ok) throw new Error("lost");
-      const job = await res.json();
-      p.progress = job.progress || 0;
-      p.stage = job.stage || job.status;
-      p.status = job.status;
-      p.logs = job.logs || [];
-      if (job.status === "done") {
-        pending.delete(id);
-        loadSubtitles(); loadLibrary();
-      } else if (job.status === "canceled") {
-        pending.delete(id);
-      } else if (job.status === "error" || job.status === "interrupted") {
-        // keep the card visible so the failure (and why) isn't lost
-        // ("interrupted" = the worker restarted mid-job; user retries from the library)
-        p.error = job.error || (job.logs || []).slice(-1)[0] || "Transcription failed";
-      }
-    } catch {
-      pending.delete(id);
-    }
-  }
+// live-tail one transcription job over SSE
+function openJobStream(id) {
+  closeJobStream(id);
+  const es = new EventSource("/api/jobs/" + id + "/events");
+  es.onmessage = (e) => applyJobSnapshot(id, JSON.parse(e.data));
+  jobSources.set(id, es);
+}
+function closeJobStream(id) {
+  const es = jobSources.get(id);
+  if (es) { es.close(); jobSources.delete(id); }
+}
 
-  // feature the running (or next) job in the right-hand Transcription panel
+function applyJobSnapshot(id, job) {
+  const p = pending.get(id);
+  if (!p) return;
+  p.progress = job.progress || 0;
+  p.stage = job.stage || job.status;
+  p.status = job.status;
+  p.logs = job.logs || [];
+  if (job.status === "done") {
+    pending.delete(id); closeJobStream(id);
+    loadSubtitles(); loadLibrary();
+  } else if (job.status === "canceled") {
+    pending.delete(id); closeJobStream(id);
+  } else if (job.status === "error" || job.status === "interrupted") {
+    // keep the card visible so the failure (and why) isn't lost
+    p.error = job.error || (job.logs || []).slice(-1)[0] || "Transcription failed";
+    closeJobStream(id);   // the stream already ended at the terminal state
+  }
+  refreshJobsUI();
+}
+
+// re-render the centre placeholders + the right-hand Transcription panel
+function refreshJobsUI() {
   let lead = null;
   for (const p of pending.values()) { if (p.status === "running" || STEP_ORDER.includes(p.stage)) { lead = p; break; } }
   if (!lead) lead = pending.values().next().value || null;
@@ -605,15 +868,18 @@ async function pollAll() {
     $("log").textContent = (lead.logs || []).join("\n");
     $("log").scrollTop = $("log").scrollHeight;
   }
-  // stop polling once nothing is still running/queued (errored cards may linger)
+  // hide the panel shortly after nothing is still running/queued (errored cards linger)
   const active = [...pending.values()].some(
     (p) => p.status === "running" || p.status === "queued" || p.canceling);
   if (!active) {
-    clearInterval(jobTimer); jobTimer = null;
     if (!lead) { setStage("done", "done"); setProgress(1, "done"); }
-    setTimeout(() => { if (!jobTimer) { $("job").classList.add("hidden"); updateActivityEmpty(); } }, 2500);
+    setTimeout(() => {
+      const still = [...pending.values()].some(
+        (p) => p.status === "running" || p.status === "queued" || p.canceling);
+      if (!still) { $("job").classList.add("hidden"); updateActivityEmpty(); }
+    }, 2500);
   }
-  setActivityDot();
+  updateActivityEmpty(); setActivityDot();
 }
 
 // disabled "filling" placeholder cards in the centre column, one per active job
@@ -629,7 +895,8 @@ function renderPending() {
       : stopping ? "Stopping…"
       : (p.status === "queued" ? "Queued…" : (STAGE_LABELS[p.stage] || p.stage));
     const btn = err
-      ? `<button class="ds-stop" data-dismiss="${id}" title="Dismiss">${ACT.del}</button>`
+      ? `<button class="ds-stop retry" data-retry="${id}" title="Retry">${ICO.retry}</button>
+         <button class="ds-stop" data-dismiss="${id}" title="Dismiss">${ACT.del}</button>`
       : `<button class="ds-stop" data-cancel="${id}" title="Stop"${stopping ? " disabled" : ""}>${ICO.stop}</button>`;
     return `<div class="rowcard pending${err ? " err" : ""}" aria-disabled="true">
       <div class="ds-fill" style="width:${err ? 100 : pct}%"></div>
@@ -646,13 +913,28 @@ function renderPending() {
     b.addEventListener("click", () => cancelJob(b.dataset.cancel)));
   box.querySelectorAll("[data-dismiss]").forEach((b) =>
     b.addEventListener("click", () => { pending.delete(b.dataset.dismiss); renderPending(); }));
+  box.querySelectorAll("[data-retry]").forEach((b) =>
+    b.addEventListener("click", () => retryJob(b.dataset.retry, b)));
+}
+
+async function retryJob(id, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/retry`, { method: "POST" });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Retry failed");
+    const p = pending.get(id);
+    if (p) { p.status = "queued"; p.stage = "queued"; p.progress = 0; p.error = null; delete p.canceling; }
+    $("job").classList.remove("hidden");
+    openJobStream(id);            // re-attach (the previous stream closed on error)
+    refreshJobsUI();
+  } catch (err) { alert(err.message); if (btn) btn.disabled = false; }
 }
 
 async function cancelJob(id) {
   const p = pending.get(id);
   if (p) { p.canceling = true; renderPending(); }
   try { await fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }); }
-  catch { /* pollAll will reconcile */ }
+  catch { /* the live stream will reconcile */ }
 }
 function cancelAll() { [...pending.keys()].forEach(cancelJob); }
 $("job-stop").addEventListener("click", (e) => { e.stopPropagation(); cancelAll(); });
@@ -683,11 +965,13 @@ function setProgress(frac, status) {
 
 // ---------- activity helpers ----------
 function updateActivityEmpty() {
-  const running = !$("downloads").classList.contains("hidden") || !$("job").classList.contains("hidden");
-  $("activity-empty").classList.toggle("hidden", running);
+  // downloads now live in the left "Sources" column; Activity tracks jobs only
+  $("activity-empty").classList.toggle("hidden", !$("job").classList.contains("hidden"));
 }
 function setActivityDot() {
-  $("activity-dot").classList.toggle("on", !!dlTimer || !!jobTimer);
+  const busy = [...pending.values()].some(
+    (p) => p.status === "running" || p.status === "queued" || p.canceling);
+  $("activity-dot").classList.toggle("on", busy);
 }
 
 // ============================================================
@@ -808,11 +1092,9 @@ async function resumeJobs() {
       name: j.file, title: j.title || j.file,
       progress: j.progress || 0, stage: j.stage || j.status, status: j.status, logs: [],
     }));
-    renderPending();
     $("job").classList.remove("hidden");
-    updateActivityEmpty(); setActivityDot();
-    if (!jobTimer) jobTimer = setInterval(pollAll, 1000);
-    pollAll();
+    items.forEach((j) => openJobStream(j.id));
+    refreshJobsUI();
   } catch { /* ignore */ }
 }
 async function resumeDownloads() {
@@ -820,9 +1102,18 @@ async function resumeDownloads() {
     const { items } = await (await fetch("/api/downloads")).json();
     const active = (items || [])[0];
     if (!active) return;
-    if (dlTimer) clearInterval(dlTimer);
-    dlTimer = setInterval(() => pollDownload(active.id), 1000);
-    pollDownload(active.id);
+    // thumbnails aren't known after a reload — rows fall back to placeholders
+    dlThumbs = {};
+    dlControls.classList.add("hidden");
+    fetchBtn.disabled = true; urlInput.disabled = true;
+    openDownloadStream(active.id);
+  } catch { /* ignore */ }
+}
+// re-attach to translations still running server-side (they show on the card)
+async function resumeTranslations() {
+  try {
+    const { items } = await (await fetch("/api/translate")).json();
+    (items || []).forEach((t) => startTranslateJob(t.id));
   } catch { /* ignore */ }
 }
 
@@ -834,3 +1125,4 @@ loadSubtitles();
 loadLibrary();
 resumeJobs();
 resumeDownloads();
+resumeTranslations();

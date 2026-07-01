@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import time
@@ -23,6 +24,38 @@ def write_srt(segments, srt_path):
             end = format_timestamp(seg["end"])
             text = seg.get("text", "")
             f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+
+
+# --- per-segment speaker labels (kept beside the .srt, not in it) ------------
+# An .srt has no speaker field, so diarization labels would be lost on write.
+# We store them in a parallel JSON list (same order as the .srt cues) so the
+# dataset view/exports can show them without polluting the subtitle text.
+def speakers_path(srt_path):
+    return os.path.splitext(srt_path)[0] + ".speakers.json"
+
+
+def write_speakers(srt_path, segments):
+    """Write [speaker | None per segment] beside `srt_path`. No-op (and no file)
+    when diarization produced no speakers, so old/unlabeled datasets stay clean."""
+    labels = [seg.get("speaker") for seg in segments]
+    if not any(labels):
+        return None
+    with open(speakers_path(srt_path), "w", encoding="utf-8") as f:
+        json.dump(labels, f)
+    return speakers_path(srt_path)
+
+
+def read_speakers(srt_path):
+    """Per-segment speaker labels for `srt_path`, or [] if there is no sidecar."""
+    p = speakers_path(srt_path)
+    if not os.path.exists(p):
+        return []
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
 
 
 def _ts_to_seconds(ts):

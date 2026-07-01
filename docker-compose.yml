@@ -8,7 +8,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data:/data           # inputs + generated .srt + job state (voxset.db) land here
+      - ./data:/data           # media library + generated .srt land here (job state is in-memory)
       - model-cache:/cache     # persist downloaded models between runs
     # GPU access. Requires NVIDIA Container Toolkit (Linux) or Docker Desktop
     # GPU support (Windows/WSL2). No GPU? Use docker-compose.cpu.yml instead.

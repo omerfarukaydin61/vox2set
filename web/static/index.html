@@ -179,21 +179,6 @@
             </div>
           </div>
 
-          <!-- Downloads (collapsible) -->
-          <div id="downloads" class="mini-card hidden">
-            <div class="mini-card-head" data-toggle>
-              <div class="mch-title">
-                <span class="mch-ico"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12m0 0 4-4m-4 4-4-4M4 20h16"/></svg></span>
-                <h3>Downloading</h3>
-              </div>
-              <div class="mch-meta">
-                <span id="dl-summary" class="muted"></span>
-                <svg class="mch-chev" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
-              </div>
-            </div>
-            <div class="mini-card-body"><div id="dl-list" class="dl-list"></div></div>
-          </div>
-
           <!-- Transcription (collapsible) -->
           <div id="job" class="mini-card hidden">
             <div class="mini-card-head" data-toggle>
@@ -248,7 +233,7 @@
       <p id="modal-file" class="modal-file"></p>
       <form id="tx-form">
         <div class="field">
-          <label for="language">Target language</label>
+          <label for="language">Audio language</label>
           <select id="language"></select>
         </div>
         <div class="field">
@@ -302,10 +287,17 @@
       <div id="ds-nomedia" class="ds-warn hidden">
         Source media is no longer in the library — audio clips and the .zip export are unavailable for this dataset.
       </div>
+      <div class="ds-translate" id="ds-translate">
+        <span class="dst-ico"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h11M9 3v2c0 5-2 8-6 10M5 9c0 3 3 6 7 7"/><path d="M14 19l4-9 4 9M16.5 15h5"/></svg></span>
+        <span class="dst-label">Translate subtitles to</span>
+        <select id="dst-lang" class="dst-sel"></select>
+        <button type="button" id="dst-go" class="btn-sm primary">Translate</button>
+        <span id="dst-status" class="dst-status"></span>
+      </div>
       <div class="ds-table-wrap">
         <table class="ds-table">
           <thead>
-            <tr><th class="c-idx">#</th><th class="c-audio">Audio</th><th class="c-text">Text</th><th class="c-time">Time</th></tr>
+            <tr><th class="c-idx">#</th><th class="c-spk">Speaker</th><th class="c-audio">Audio</th><th class="c-text">Text</th><th class="c-time">Time</th></tr>
           </thead>
           <tbody id="ds-rows"></tbody>
         </table>

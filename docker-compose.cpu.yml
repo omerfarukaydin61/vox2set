@@ -16,7 +16,7 @@ services:
       - DEVICE=cpu
       - COMPUTE_TYPE=int8
     volumes:
-      - ./data:/data           # inputs + generated .srt + job state (voxset.db) land here
+      - ./data:/data           # media library + generated .srt land here (job state is in-memory)
       - model-cache:/cache     # persist downloaded models between runs
     # No `deploy.reservations.devices` block here → no GPU is requested.
 

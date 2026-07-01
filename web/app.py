@@ -1,38 +1,38 @@
 """FastAPI web interface for VoxSet — a speech dataset builder.
 
-Two decoupled stages, each run in background threads inside this single process:
+Two decoupled stages, each run as a subprocess per job (process-per-job
+bulkhead) supervised from this single API process:
   * Downloads     — fetch a single video or a whole playlist, as audio or video,
                     into the data/ library (one download job at a time).
   * Transcription — pick a file from the library and run the whisperx pipeline
                     (transcribe/align/diarize) into a speaker-labeled speech
                     dataset, stored as an .srt (one GPU job at a time).
 
-Job state is persisted to SQLite (web/store.py → data/voxset.db), so it survives
-a container/process restart: on startup any job/download left mid-flight (its
-thread died with the old process) is reconciled to `interrupted`/failed so the
-UI shows it instead of hanging, and the user retries. The frontend polls
-/api/downloads/{id} and /api/jobs/{id} for live progress, /api/library for the
-file list, and /api/gpu for the GPU monitor.
+Job state lives in an in-memory registry (web/jobs.py): a finite state machine
+per job, a ring buffer of log lines, and a pub/sub stream. Clients tail it live
+over Server-Sent Events (/api/jobs/{id}/events, /api/downloads/{id}/events); the
+list endpoints let the UI re-attach after a page reload. State is NOT persisted,
+so a *process* restart starts empty (the media library and datasets on disk are
+unaffected); a browser reload re-attaches via the registry.
 """
 import csv
 import io
+import json
 import os
+import queue as _q
 import shutil
 import subprocess
 import tempfile
-import threading
-import uuid
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 from src import config
-from src.downloader import fetch_info, download_media, thumb_for
-from src.pipeline import run_pipeline
-from src.util import parse_srt
-from web import store
+from src.downloader import fetch_info
+from src.util import parse_srt, read_speakers, speakers_path
+from web import jobs, runner
 from web.meta import meta_path, read_meta, write_meta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -43,20 +43,13 @@ app = FastAPI(title="VoxSet")
 AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".opus", ".flac", ".aac", ".ogg"}
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi"}
 
-_run_lock = threading.Lock()         # one GPU pipeline at a time
-_dl_lock = threading.Lock()          # one download job at a time
-
-# Coarse progress fractions for the (callback-less) whisperx stages.
-_STAGE_FRAC = {"info": 0.40, "load": 0.45, "transcribe": 0.60,
-               "align": 0.75, "diarize": 0.88, "write": 0.96, "done": 1.0}
-
 
 def _migrate_flat_layout():
     """Move any pre-existing flat data/ files into media/ and subtitles/.
 
     Older versions dumped media, .meta.json sidecars and subtitle-*.srt all in
     the data/ root. This relocates them once so an upgrade doesn't "lose" the
-    library. voxset.db, .gitkeep and stray *.part files stay at the root.
+    library. .gitkeep and stray *.part files stay at the root.
     """
     d = config.DATA_DIR
     if not os.path.isdir(d):
@@ -83,13 +76,10 @@ def _migrate_flat_layout():
 
 @app.on_event("startup")
 def _recover():
-    """Tidy the data layout, then flag jobs orphaned by a previous process."""
+    """Tidy the data layout on startup. Job state is in-memory, so there is no
+    persisted work to reconcile — a fresh process simply starts with no jobs."""
     try:
         _migrate_flat_layout()
-    except Exception:
-        pass
-    try:
-        store.reconcile()
     except Exception:
         pass
 
@@ -127,87 +117,33 @@ def _list_library():
 
 
 # --------------------------------------------------------------------------- #
-# Download worker (one at a time)
+# Server-Sent Events: snapshot + live tail of one job
 # --------------------------------------------------------------------------- #
-def _download_worker(dl_id, items, mode, quality):
-    with _dl_lock:
-        store.update_download(dl_id, status="running")
-        for idx, it in enumerate(items):
-            try:
-                store.update_download_item(dl_id, idx, status="downloading", progress=0.0)
-
-                last = {"pct": -1}
-
-                def hook(d, idx=idx, last=last):
-                    if d.get("status") == "downloading":
-                        total = d.get("total_bytes") or d.get("total_bytes_estimate")
-                        if total:
-                            frac = d.get("downloaded_bytes", 0) / total
-                            pct = int(frac * 100)
-                            if pct != last["pct"]:        # throttle DB writes
-                                last["pct"] = pct
-                                store.update_download_item(dl_id, idx, progress=frac)
-                    elif d.get("status") == "finished":
-                        store.update_download_item(dl_id, idx, progress=1.0,
-                                                   status="processing")
-
-                path, info = download_media(
-                    it["url"], config.MEDIA_DIR, mode=mode, quality=quality,
-                    codec=config.AUDIO_CODEC, progress_hook=hook)
-
-                base = os.path.splitext(os.path.basename(path))[0]
-                meta = {
-                    "title": info.get("title") or it["title"],
-                    "duration": info.get("duration"),
-                    "kind": mode,
-                    "url": it["url"],
-                    "thumbnail": thumb_for(info),
-                }
-                if it.get("playlist"):
-                    meta["playlist"] = it["playlist"]
-                write_meta(base, meta)
-                store.update_download_item(dl_id, idx, status="done", progress=1.0,
-                                           file=os.path.basename(path))
-            except Exception as exc:  # one bad item shouldn't kill the rest
-                store.update_download_item(dl_id, idx, status="error", error=str(exc))
-        store.update_download(dl_id, status="done")
-
-
-# --------------------------------------------------------------------------- #
-# Transcription worker (one at a time)
-# --------------------------------------------------------------------------- #
-class _JobCancelled(Exception):
-    """Raised inside the pipeline's progress callback to abort a job."""
-
-
-def _worker(job_id, params):
-    with _run_lock:  # serialize GPU work
-        # the job may have been canceled while queued (waiting for the lock)
-        if store.is_canceled(job_id):
-            store.update_job(job_id, status="canceled", stage="canceled")
+def _sse_stream(jid):
+    """Yield SSE frames: the current snapshot, then every subsequent snapshot,
+    until the job reaches a terminal state. A periodic comment keeps the
+    connection from idling out."""
+    snap, q = jobs.subscribe(jid)
+    if snap is None:
+        return
+    try:
+        yield f"data: {json.dumps(snap)}\n\n"
+        if snap.get("status") in jobs.TERMINAL:
             return
-        store.update_job(job_id, status="running", stage="starting")
+        while True:
+            try:
+                snap = q.get(timeout=15)
+            except _q.Empty:
+                yield ": keep-alive\n\n"
+                continue
+            yield f"data: {json.dumps(snap)}\n\n"
+            if snap.get("status") in jobs.TERMINAL:
+                return
+    finally:
+        jobs.unsubscribe(jid, q)
 
-        def prog(stage, msg):
-            # cooperative cancellation: checked at every pipeline stage boundary
-            if store.is_canceled(job_id):
-                raise _JobCancelled()
-            store.append_log(job_id, msg, stage=stage, progress=_STAGE_FRAC.get(stage))
 
-        # HF_TOKEN and the media/subtitle dirs come from the server env, never the
-        # form. Audio is resolved in media/, the .srt is written to subtitles/.
-        full = dict(params, hf_token=config.HF_TOKEN,
-                    data_dir=config.MEDIA_DIR, out_dir=config.SUBS_DIR)
-        try:
-            srt_path = run_pipeline(progress=prog, **full)
-            store.update_job(job_id, status="done", stage="done", progress=1.0,
-                             srt=os.path.basename(srt_path))
-        except _JobCancelled:
-            store.append_log(job_id, "Job canceled by user.", stage="canceled")
-            store.update_job(job_id, status="canceled", stage="canceled")
-        except Exception as exc:  # surface the failure to the UI
-            store.append_log(job_id, f"ERROR: {exc}", stage="error")
-            store.update_job(job_id, status="error", error=str(exc))
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
 # --------------------------------------------------------------------------- #
@@ -256,25 +192,66 @@ def create_download(
         raise HTTPException(400, "Nothing to download.")
 
     os.makedirs(config.MEDIA_DIR, exist_ok=True)
-    dl_id = uuid.uuid4().hex[:12]
-    store.create_download(dl_id, items)
-    threading.Thread(target=_download_worker, args=(dl_id, items, mode, quality),
-                     daemon=True).start()
+    dl_id = runner.submit_download(items, mode, quality)
     return {"download_id": dl_id, "count": len(items)}
+
+
+def _get_download_or_404(dl_id):
+    dl = jobs.get(dl_id)
+    if dl is None or dl.get("kind") != "download":
+        raise HTTPException(404, "Unknown download id.")
+    return dl
 
 
 @app.get("/api/downloads")
 def list_downloads():
-    """Active (not-done) downloads — lets the UI resume after a reload."""
-    return {"items": store.list_active_downloads()}
+    """Active downloads — lets the UI re-attach after a reload."""
+    return {"items": [{"id": j["id"], "status": j["status"]}
+                      for j in jobs.list_active("download")]}
 
 
 @app.get("/api/downloads/{dl_id}")
 def get_download(dl_id: str):
-    dl = store.get_download(dl_id)
-    if dl is None:
-        raise HTTPException(404, "Unknown download id.")
-    return dl
+    return _get_download_or_404(dl_id)
+
+
+@app.get("/api/downloads/{dl_id}/events")
+def download_events(dl_id: str):
+    _get_download_or_404(dl_id)
+    return StreamingResponse(_sse_stream(dl_id), media_type="text/event-stream",
+                             headers=_SSE_HEADERS)
+
+
+@app.post("/api/downloads/{dl_id}/cancel")
+def cancel_download(dl_id: str):
+    _get_download_or_404(dl_id)
+    status = runner.cancel_download(dl_id)
+    return {"ok": True, "status": status}
+
+
+@app.post("/api/downloads/{dl_id}/cancel/{idx}")
+def cancel_download_item(dl_id: str, idx: int):
+    dl = _get_download_or_404(dl_id)
+    if not (0 <= idx < len(dl.get("items", []))):
+        raise HTTPException(404, "Unknown item index.")
+    # Cancel just this entry; the rest of the playlist keeps going. A pending
+    # item is marked canceled immediately, a downloading one aborts at its next
+    # yt-dlp progress tick.
+    runner.cancel_download_item(dl_id, idx)
+    return {"ok": True}
+
+
+@app.post("/api/downloads/{dl_id}/retry/{idx}")
+def retry_download_item(dl_id: str, idx: int):
+    dl = _get_download_or_404(dl_id)
+    if not (0 <= idx < len(dl.get("items", []))):
+        raise HTTPException(404, "Unknown item index.")
+    if dl["items"][idx]["status"] != "error":
+        raise HTTPException(400, "Only failed items can be retried.")
+    if not dl["items"][idx].get("url"):
+        raise HTTPException(400, "No saved URL to retry this item.")
+    runner.retry_download_item(dl_id, idx)
+    return {"ok": True}
 
 
 @app.post("/api/upload")
@@ -334,11 +311,12 @@ def delete_media(name: str):
         raise HTTPException(404, "File not found.")
     base = os.path.splitext(os.path.basename(name))[0]
     os.remove(path)
-    # also remove sidecar meta and any generated subtitles for this file
+    # also remove sidecar meta and any generated subtitles (+ their speaker
+    # sidecars) for this file
     subs = (os.listdir(config.SUBS_DIR) if os.path.isdir(config.SUBS_DIR) else [])
-    for extra in [meta_path(base)] + [
-            os.path.join(config.SUBS_DIR, s) for s in subs
-            if s.startswith("subtitle-") and s.endswith(f"-{base}.srt")]:
+    srt_paths = [os.path.join(config.SUBS_DIR, s) for s in subs
+                 if s.startswith("subtitle-") and s.endswith(f"-{base}.srt")]
+    for extra in [meta_path(base)] + srt_paths + [speakers_path(p) for p in srt_paths]:
         try:
             os.remove(extra)
         except OSError:
@@ -374,6 +352,7 @@ def _list_subtitles():
         out.append({
             "name": f,
             "lang": lang,
+            "base": base,
             "title": meta.get("title") or base or f,
             "size": os.path.getsize(path),
             "mtime": os.path.getmtime(path),
@@ -393,6 +372,10 @@ def delete_subtitle(name: str):
     if not name.lower().endswith(".srt") or not os.path.exists(path):
         raise HTTPException(404, "Dataset not found.")
     os.remove(path)
+    try:
+        os.remove(speakers_path(path))     # drop the speaker sidecar too
+    except OSError:
+        pass
     return {"ok": True}
 
 
@@ -429,11 +412,15 @@ def dataset(name: str):
     media = _media_for_base(base)
     meta = read_meta(base) if base else {}
     segments = parse_srt(path)
+    spk = read_speakers(path)
+    for i, s in enumerate(segments):
+        s["speaker"] = spk[i] if i < len(spk) else None
     return {
         "name": name, "base": base, "lang": lang, "media": media,
         "title": meta.get("title") or base or name,
         "count": len(segments),
         "duration": (segments[-1]["end"] if segments else 0),
+        "speakers": sorted({s for s in spk if s}),
         "segments": segments,
     }
 
@@ -471,13 +458,15 @@ def export_dataset(name: str, fmt: str = "zip"):
     _, base = _srt_lang_base(name)
     stem = base or os.path.splitext(name)[0]
     segments = parse_srt(path)
+    spk = read_speakers(path)
+    speaker = lambda i: (spk[i] if i < len(spk) else "") or ""
 
     if fmt == "csv":
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["id", "start", "end", "text"])
-        for s in segments:
-            w.writerow([s["index"], f"{s['start']:.3f}", f"{s['end']:.3f}", s["text"]])
+        w.writerow(["id", "speaker", "start", "end", "text"])
+        for i, s in enumerate(segments):
+            w.writerow([s["index"], speaker(i), f"{s['start']:.3f}", f"{s['end']:.3f}", s["text"]])
         return Response(
             buf.getvalue(), media_type="text/csv",
             headers={"Content-Disposition": f'attachment; filename="{stem}-dataset.csv"'})
@@ -491,16 +480,16 @@ def export_dataset(name: str, fmt: str = "zip"):
     tmpdir = tempfile.mkdtemp()
     try:
         rows = []
-        for s in segments:
+        for i, s in enumerate(segments):
             fname = f"seg-{s['index']:04d}.wav"
             _crop_clip(media_path, s["start"], s["end"], os.path.join(tmpdir, fname))
-            rows.append((f"clips/{fname}", s["start"], s["end"], s["text"]))
+            rows.append((f"clips/{fname}", speaker(i), s["start"], s["end"], s["text"]))
 
         meta_buf = io.StringIO()
         w = csv.writer(meta_buf)
-        w.writerow(["file", "start", "end", "text"])
-        for cn, st, en, tx in rows:
-            w.writerow([cn, f"{st:.3f}", f"{en:.3f}", tx])
+        w.writerow(["file", "speaker", "start", "end", "text"])
+        for cn, sp, st, en, tx in rows:
+            w.writerow([cn, sp, f"{st:.3f}", f"{en:.3f}", tx])
 
         import zipfile
         zip_path = os.path.join(tmpdir, "_dataset.zip")
@@ -514,6 +503,69 @@ def export_dataset(name: str, fmt: str = "zip"):
     except subprocess.CalledProcessError:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise HTTPException(500, "ffmpeg failed while cutting the dataset clips.")
+
+
+# --------------------------------------------------------------------------- #
+# Translate a dataset's .srt into another language (sentence-merge → NLLB →
+# reflow). Driven entirely from the dataset modal; tailed over SSE there.
+# --------------------------------------------------------------------------- #
+@app.post("/api/dataset/{name}/translate")
+def translate_dataset(name: str, to: str = Form(...)):
+    from src.translate import FLORES
+    path = _safe_subs(name)
+    if not name.lower().endswith(".srt") or not os.path.exists(path):
+        raise HTTPException(404, "Dataset not found.")
+    lang, base = _srt_lang_base(name)
+    src = (lang or "").lower()
+    target = to.strip().lower()
+    if not src:
+        raise HTTPException(400, "Source language is unknown for this dataset.")
+    if not target:
+        raise HTTPException(400, "No target language.")
+    if src == target:
+        raise HTTPException(400, "Source and target language are the same.")
+    if src not in FLORES:
+        raise HTTPException(400, f"Translation source language not supported: {src}")
+    if target not in FLORES:
+        raise HTTPException(400, f"Translation target language not supported: {target}")
+    title = (read_meta(base).get("title") if base else None) or base
+    job_id = runner.submit_translate(name, base, src, target, title=title)
+    return {"job_id": job_id}
+
+
+@app.get("/api/translate")
+def list_translations():
+    """Active translation jobs — lets the UI re-attach after a page reload."""
+    return {"items": [{"id": j["id"], "base": (j.get("params") or {}).get("base"),
+                       "target": j.get("target"), "status": j["status"],
+                       "progress": j.get("progress", 0.0)}
+                      for j in jobs.list_active("translate")]}
+
+
+def _get_translate_or_404(job_id):
+    j = jobs.get(job_id)
+    if j is None or j.get("kind") != "translate":
+        raise HTTPException(404, "Unknown translate job.")
+    return j
+
+
+@app.get("/api/translate/{job_id}")
+def get_translate(job_id: str):
+    return _get_translate_or_404(job_id)
+
+
+@app.get("/api/translate/{job_id}/events")
+def translate_events(job_id: str):
+    _get_translate_or_404(job_id)
+    return StreamingResponse(_sse_stream(job_id), media_type="text/event-stream",
+                             headers=_SSE_HEADERS)
+
+
+@app.post("/api/translate/{job_id}/cancel")
+def cancel_translate(job_id: str):
+    _get_translate_or_404(job_id)
+    runner.cancel_translate(job_id)
+    return {"ok": True}
 
 
 @app.post("/api/jobs")
@@ -534,47 +586,68 @@ def create_job(
         "compute_type": compute_type, "batch_size": batch_size,
     }
     base = os.path.splitext(os.path.basename(filename))[0]
-    job_id = uuid.uuid4().hex[:12]
-    store.create_job(job_id, file=os.path.basename(filename),
-                     title=read_meta(base).get("title") or base)
-    threading.Thread(target=_worker, args=(job_id, params), daemon=True).start()
+    title = read_meta(base).get("title") or base
+    job_id = runner.submit_transcribe(os.path.basename(filename), title, params)
     return {"job_id": job_id}
 
 
-@app.get("/api/jobs")
-def list_jobs():
-    """Active (queued/running) transcription jobs — lets the UI resume after a reload."""
-    return {"items": store.list_active_jobs()}
-
-
-@app.get("/api/jobs/{job_id}")
-def get_job(job_id: str):
-    job = store.get_job(job_id)
-    if job is None:
+def _get_job_or_404(job_id):
+    job = jobs.get(job_id)
+    if job is None or job.get("kind") != "transcribe":
         raise HTTPException(404, "Unknown job id.")
     return job
 
 
+@app.get("/api/jobs")
+def list_jobs():
+    """Active (queued/running) transcription jobs — lets the UI re-attach after a reload."""
+    return {"items": [{"id": j["id"], "file": j.get("file"),
+                       "title": j.get("title") or j.get("file"),
+                       "status": j["status"], "stage": j.get("stage"),
+                       "progress": j.get("progress", 0.0)}
+                      for j in jobs.list_active("transcribe")]}
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str):
+    return _get_job_or_404(job_id)
+
+
+@app.get("/api/jobs/{job_id}/events")
+def job_events(job_id: str):
+    _get_job_or_404(job_id)
+    return StreamingResponse(_sse_stream(job_id), media_type="text/event-stream",
+                             headers=_SSE_HEADERS)
+
+
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
-    job = store.get_job(job_id)
-    if job is None:
-        raise HTTPException(404, "Unknown job id.")
-    if job["status"] in ("done", "error", "canceled", "interrupted"):
-        return {"ok": True, "status": job["status"]}
-    # Cooperative cancellation: a running worker checks the flag at each pipeline
-    # stage boundary. A still-queued job is canceled immediately (and the worker
-    # short-circuits when it later acquires _run_lock).
-    store.request_cancel(job_id)
-    if job["status"] == "queued":
-        job = store.update_job(job_id, status="canceled", stage="canceled")
-    return {"ok": True, "status": job["status"]}
+    _get_job_or_404(job_id)
+    # transcribe cancel terminates the subprocess (frees the GPU immediately);
+    # a still-queued job is marked canceled before it ever spawns.
+    status = runner.cancel_transcribe(job_id)
+    return {"ok": True, "status": status}
+
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_job(job_id: str):
+    job = _get_job_or_404(job_id)
+    if job["status"] not in ("error", "interrupted", "canceled"):
+        raise HTTPException(400, "Only failed jobs can be retried.")
+    params = job.get("params")
+    if not params or not params.get("audio_file"):
+        raise HTTPException(400, "No saved settings to retry this job.")
+    if not os.path.exists(_safe_media(params["audio_file"])):
+        raise HTTPException(404, "Source file is no longer in the library.")
+    # reuse the same id so the existing card revives in place
+    runner.retry_transcribe(job_id)
+    return {"ok": True}
 
 
 @app.get("/api/jobs/{job_id}/srt")
 def download_job_srt(job_id: str):
-    job = store.get_job(job_id)
-    if job is None or not job.get("srt"):
+    job = _get_job_or_404(job_id)
+    if not job.get("srt"):
         raise HTTPException(404, "No transcript available for this job.")
     path = os.path.join(config.SUBS_DIR, job["srt"])
     if not os.path.exists(path):

@@ -4,6 +4,9 @@ whisperx==3.3.4
 # API directly, so pin 4.x explicitly to keep that contract stable.
 pyannote.audio==4.0.4
 omegaconf
+# NLLB subtitle translation (dataset modal "Translate subtitles to…"). transformers
+# is already pulled in by whisperx; the NLLB tokenizer additionally needs SentencePiece.
+sentencepiece
 yt-dlp
 python-dotenv
 pandas
